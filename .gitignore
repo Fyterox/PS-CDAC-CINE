@@ -1,0 +1,39 @@
+# ---- NEVER COMMIT: model weights ----
+# The ViT checkpoint is ~343 MB — well over GitHub's 100 MB hard limit.
+# Ship weights via GitHub Releases, Git LFS, or a Drive link in the README.
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+ckpts/
+runs/
+
+# ---- NEVER COMMIT: the dataset ----
+# DFFD is access-gated and its licenses forbid redistribution.
+DFFD/
+DFFD_raw/
+data/
+*.zip
+
+# ---- Machine-specific / derived ----
+# manifest.csv holds ABSOLUTE paths from whoever generated it — regenerate locally
+# with build_manifest_dffd.py instead of committing one person's paths.
+manifest.csv
+*.csv
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---- Notebooks ----
+.ipynb_checkpoints/
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
