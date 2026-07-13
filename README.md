@@ -35,39 +35,43 @@ RGB stream steamroll the two randomly-initialized ones.
 
 ## Results
 
-Validation set, DFFD's official identity-disjoint split:
+Held-out test set (53,381 images), DFFD's official identity-disjoint split:
 
 | Metric | |
 |---|---|
-| Fake recall | 0.968 |
-| F1 | 0.982 |
-| ROC-AUC | 0.995 |
-| Accuracy | 0.969 |
+| Fake recall | 0.992 |
+| Precision | 0.995 |
+| F1 | 0.993 |
+| ROC-AUC | 0.999 |
+| Accuracy | 0.989 |
 
 Broken down by generator:
 
-| Generator | Caught as fake |
-|---|---|
-| StarGAN | 1.00 |
-| PGGAN | 1.00 |
-| StyleGAN | 0.99 |
-| FaceApp | 0.82 |
-| real faces | 0.02 wrongly flagged |
+| Generator | n | Caught as fake |
+|---|---|---|
+| StarGAN | 21,913 | 1.000 |
+| PGGAN | 8,970 | 1.000 |
+| StyleGAN | 8,997 | 0.997 |
+| FaceApp | 4,501 | 0.929 |
+| real faces | 9,000 | 0.026 wrongly flagged |
 
-Two things I found that I'd rather write down than hide.
+The number I care about is fake recall, because the whole problem was fakes slipping
+through. It went 0.29 (ViT on unseen generators) → 0.79 (same ViT, fine-tuned on DFFD) →
+**0.99** with the three streams fused. FaceApp, the category that motivated the whole
+design, went from being the model's blind spot to 0.93.
 
-The first is that FaceApp recall in the fused model (0.82) is actually *worse* than what the
-frequency stream managed on its own (0.92) when I trained it standalone in Stage 1. So the
-fusion is diluting the signal that works best on FaceApp rather than amplifying it. My guess
-is the RGB stream — the one that's weakest on FaceApp — is dominating the fused
-representation because it comes in pretrained and confident. Raising the auxiliary loss
-weight is the next thing I want to try.
+Two things worth writing down anyway.
 
-The second is that unfreezing the RGB backbone made things worse, not better. The model
-peaked at epoch 1 with the backbone frozen. When I unfroze everything for end-to-end
-fine-tuning, calibration fell apart — at one point it was flagging 46% of real faces as
-fake. So the recipe I'd actually recommend is a short run with RGB frozen the whole way,
-which is what the command below does.
+FaceApp is still the weakest row, and that's not surprising — it's the only manipulation here
+that edits a real photo instead of generating one, so there's simply less signal to find. The
+other three generators are essentially saturated.
+
+The other is a training result that surprised me: **unfreezing the RGB backbone made things
+worse.** My first run used a staged schedule that froze the ViT for four epochs then
+fine-tuned everything end-to-end. The model peaked at epoch 1, while frozen. Once I unfroze
+it, calibration fell apart — at one point it was flagging 46% of *real* faces as fake — and
+it never recovered its earlier score. So the recipe below keeps RGB frozen the whole way,
+which is both better and about three times faster.
 
 ## What's in here
 
@@ -190,10 +194,15 @@ Drive.
 
 ## What's next
 
-Raise the auxiliary loss weight (0.3 → around 0.6) and see if FaceApp recall in the fused
-model can beat the frequency stream's standalone 0.92. Report test-split numbers rather than
-validation. Then extend to diffusion-generated faces, which should just be a new folder and
-a tag since nothing in the pipeline is generator-specific.
+FaceApp at 0.93 is the obvious place to keep pushing, since it's the only generator that
+isn't saturated. The lever I'd try first is the auxiliary loss weight (0.3 → around 0.6),
+which should stop the pretrained RGB stream from dominating the fused representation and let
+the noise-residual stream — the one actually built for local edits — carry more of the
+decision.
+
+After that: extend to diffusion-generated faces, which should just be a new folder and a tag
+since nothing in the pipeline is generator-specific, and then video benchmarks
+(FaceForensics++, Celeb-DF) by extracting frames into the same manifest schema.
 
 ## Credit
 
