@@ -1,166 +1,201 @@
-# Multi-Stream Deepfake Detector (RGB + Frequency + Noise-Residual, Cross-Attention Fusion)
+# Multi-Stream Deepfake Detection
 
-The Week-3+ model from your PS-I framework slide, built end-to-end. It targets
-the exact failure your cross-generator study exposed: a single RGB ViT misses
-**FaceApp-style local attribute edits** because they leave weak *global*
-artifacts. Two extra streams attack that directly:
+Deepfake detector that combines three views of an image (RGB, frequency spectrum, and noise
+residuals) instead of relying on a single backbone. Built during my Practice School-I
+project at C-DAC.
 
-| Stream | Sees | Catches |
+## Why I built this
+
+I started with the obvious thing: fine-tune a ViT-Base/16 to classify real vs fake faces.
+On a 140K-image dataset it hit over 99% accuracy and a ROC-AUC around 1.0. Looked solved.
+
+Then I tested it on generators it hadn't seen, using the Diverse Fake Face Dataset (DFFD).
+Recall on fakes dropped to about 30%. The model had learned to recognize *those particular
+fakes*, not fakes in general.
+
+Fine-tuning on DFFD fixed most of it, but one category kept failing: FaceApp. It took me a
+while to see why. FaceApp doesn't generate a face from scratch, it edits a real one — it
+changes a smile or an age or a hairline and leaves the rest of the photo alone. So there's
+no global weirdness for a semantic model to latch onto. The image basically *is* a real
+photo, with a small region that isn't.
+
+That's what pushed me toward multiple streams. If the global view can't see the edit, give
+the model views that can:
+
+| Stream | What it looks at | What it's good at |
 |---|---|---|
-| **RGB** (your fine-tuned ViT-B/16) | semantics / global appearance | full-face synthesis (StyleGAN, PGGAN) |
-| **Frequency** (FFT log-mag → CNN) | spectral / grid artifacts from up-sampling | GAN & diffusion fingerprints |
-| **Noise-residual** (SRM + Bayar → CNN) | local noise/sensor inconsistency | **FaceApp** local edits, splices, re-renders |
+| RGB (ViT-B/16) | Semantics, overall appearance | Fully synthesized faces (StyleGAN, PGGAN) |
+| Frequency (FFT → CNN) | Log-magnitude spectrum | Upsampling grids and GAN fingerprints |
+| Noise residual (SRM + Bayar → CNN) | Local high-pass residuals | FaceApp-style local edits, splices |
 
-The three streams are fused by a **cross-attention transformer**: every stream's
-tokens attend to every other stream's tokens, and a learnable `[FUSION]` token is
-read into the classifier.
+The three encoders each produce a sequence of tokens, and a cross-attention transformer
+lets them attend to each other before the classifier sees anything. There's also an
+auxiliary head on each stream during training, which I added after watching the pretrained
+RGB stream steamroll the two randomly-initialized ones.
 
----
+## Results
 
-## Files
+Validation set, DFFD's official identity-disjoint split:
+
+| Metric | |
+|---|---|
+| Fake recall | 0.968 |
+| F1 | 0.982 |
+| ROC-AUC | 0.995 |
+| Accuracy | 0.969 |
+
+Broken down by generator:
+
+| Generator | Caught as fake |
+|---|---|
+| StarGAN | 1.00 |
+| PGGAN | 1.00 |
+| StyleGAN | 0.99 |
+| FaceApp | 0.82 |
+| real faces | 0.02 wrongly flagged |
+
+Two things I found that I'd rather write down than hide.
+
+The first is that FaceApp recall in the fused model (0.82) is actually *worse* than what the
+frequency stream managed on its own (0.92) when I trained it standalone in Stage 1. So the
+fusion is diluting the signal that works best on FaceApp rather than amplifying it. My guess
+is the RGB stream — the one that's weakest on FaceApp — is dominating the fused
+representation because it comes in pretrained and confident. Raising the auxiliary loss
+weight is the next thing I want to try.
+
+The second is that unfreezing the RGB backbone made things worse, not better. The model
+peaked at epoch 1 with the backbone frozen. When I unfroze everything for end-to-end
+fine-tuning, calibration fell apart — at one point it was flagging 46% of real faces as
+fake. So the recipe I'd actually recommend is a short run with RGB frozen the whole way,
+which is what the command below does.
+
+## What's in here
 
 ```
-common.py            seeds, metrics, per-generator report, ckpt IO, discriminative LR groups
-data.py              DFFDDataset (returns RAW [0,1] images), robustness aug
-build_manifest.py    build manifest.csv from your DFFD folders
+common.py               metrics, seeding, checkpoint loading, per-generator reporting
+data.py                 dataset and transforms
+build_manifest_dffd.py  builds a manifest from DFFD's folder layout
 models/
-  rgb_encoder.py     ViT-B/16, loads your DFFD checkpoint (timm or HF)
-  freq_encoder.py    FFT log-magnitude spectrum -> CNN -> tokens
-  noise_encoder.py   SRM + Bayar high-pass -> CNN -> tokens
-  fusion.py          cross-attention transformer + deep-supervision aux heads
-  detector.py        assembles the full model + single-stream wrapper for Stage 1
-pretrain_stream.py   Stage 1: warm-start freq / noise streams
-train.py             Stage 2+3: staged fusion training (freeze RGB, then unfreeze)
-evaluate.py          test metrics + per-generator table (maps to your midsem chart)
-explain.py           saliency + FFT/SRM visualisations + per-stream scores
+  rgb_encoder.py        ViT-B/16, loads a fine-tuned checkpoint
+  freq_encoder.py       FFT spectrum → CNN → tokens
+  noise_encoder.py      SRM + Bayar high-pass → CNN → tokens
+  fusion.py             cross-attention transformer, aux heads
+  detector.py           puts the whole thing together
+pretrain_stream.py      warm-starts the frequency / noise streams
+train.py                trains the fusion model
+evaluate.py             metrics + the per-generator table
+explain.py              saliency maps, FFT/SRM views, per-stream scores
+app/                    small UI — drop in an image, get a verdict
 ```
 
----
+## Getting the data
 
-## The plan (why it's staged)
+DFFD isn't a public download. You request access from
+[MSU's CVLab page](https://cse.msu.edu/computervision/dffd_dataset) and they send you
+credentials. I'm not redistributing it here — the licenses on the underlying datasets
+(FFHQ, CelebA, FaceForensics++, and the GAN sources) don't allow that.
 
-The danger with multi-stream models is that a strong pretrained stream (your ViT)
-dominates and the fresh streams never learn — you get "just the ViT" with extra
-parameters. Three defences, all baked in:
+Once you have it, the folders look like this — generator first, then split:
 
-1. **Stage 1 — warm-start the weak streams.** Train frequency and noise encoders
-   *alone* as real/fake classifiers first, so they enter fusion already useful.
-2. **Stage 2 — freeze RGB, train fusion.** New params learn to combine with a
-   frozen, already-good ViT. No corruption of your DFFD backbone.
-3. **Stage 3 — unfreeze end-to-end at discriminative LRs.** RGB gets a small LR
-   (`base_lr * 0.1`), everything else the full LR. Cosine schedule.
-4. **Deep supervision.** Each stream keeps its own aux head during training
-   (`aux_weight=0.3`), so no stream is allowed to go dead.
-
----
-
-## Run order
-
-### 0. Install
-```bash
-pip install -r requirements.txt   # Colab already has torch/torchvision
+```
+DFFD/
+  ffhq/{train,validation,test}/            real
+  faceapp/{train,validation,test}/         fake
+  stargan/{train,validation,test}/
+  pggan_v1/{train,validation,test}/
+  stylegan_ffhq/{train,validation,test}/
 ```
 
-### 1. Build the manifest (reuse your existing DFFD split!)
-```bash
-# If your DFFD is already split into train/val/test folders:
-python build_manifest.py --mode presplit --root /content/DFFD --out manifest.csv
-# If your folder names differ from the vocab, remap them:
-#   --map ffhq=real
-```
-Vocab: `real, faceapp, stargan, pggan, stylegan`. The per-generator report needs
-these tags to line up with your midsem chart.
+Use those train/validation/test folders as they are. They're DFFD's official split and,
+importantly, the identities don't overlap between them. If you shuffle the images yourself
+and make your own split, the same person's face can land in both train and test and your
+recall numbers will look better than they deserve to.
 
-### 2. Stage 1 — warm-start freq + noise (≈5 epochs each)
+One practical note: MSU's server throttles each connection to something like 85 KB/s. I
+wasted the better part of an hour on `wget` before switching to `aria2c -x16 -s16 -c`, which
+pulled the same file in under a minute.
+
+## Running it
+
 ```bash
+pip install -r requirements.txt
+
+# manifest
+python build_manifest_dffd.py --root /path/to/DFFD --out manifest.csv
+
+# warm-start the two new streams (skip if you already have the checkpoints)
 python pretrain_stream.py --stream freq  --manifest manifest.csv \
     --epochs 5 --batch-size 64 --out runs/freq_pretrain/best.pt
 python pretrain_stream.py --stream noise --manifest manifest.csv \
     --epochs 5 --batch-size 64 --out runs/noise_pretrain/best.pt
-```
 
-### 3. Stage 2+3 — train the fusion model
-```bash
+# fusion, RGB frozen throughout
 python train.py \
   --manifest manifest.csv \
-  --rgb-ckpt /content/vit_dffd.pt \
-  --freq-init runs/freq_pretrain/best.pt \
+  --rgb-ckpt   ckpts/best_model_dffd.pt \
+  --freq-init  runs/freq_pretrain/best.pt \
   --noise-init runs/noise_pretrain/best.pt \
-  --epochs 12 --freeze-rgb-epochs 4 \
+  --epochs 4 --freeze-rgb-epochs 4 \
   --batch-size 16 --accum 2 --base-lr 3e-4 \
-  --monitor f1 --out runs/fusion/best.pt
-```
-`--rgb-ckpt` is **your** DFFD-fine-tuned ViT. See "RGB checkpoint" below if you
-trained with HuggingFace instead of timm.
+  --monitor recall --out runs/fusion/best.pt
 
-### 4. Evaluate — get the numbers for your report
-```bash
 python evaluate.py --manifest manifest.csv --ckpt runs/fusion/best.pt
-```
-Prints overall metrics + the per-generator flagged-as-fake table. Read the
-**FaceApp** row against your baseline: the whole point is to lift it above the
-0.79-era number.
-
-### 5. Explainability maps
-```bash
-python explain.py --ckpt runs/fusion/best.pt --manifest manifest.csv --n 8 \
-    --out-dir runs/explain
+python explain.py  --manifest manifest.csv --ckpt runs/fusion/best.pt --n 8 --out-dir runs/explain
 ```
 
----
+`--rgb-ckpt` is your DFFD-fine-tuned ViT. When it loads, it prints how many backbone keys
+were missing. That should be 0. If it's a big number, your checkpoint is probably in
+HuggingFace format, in which case add
+`--rgb-backend hf --rgb-model google/vit-base-patch16-224-in21k`.
 
-## RGB checkpoint (read this once)
+I haven't committed the weights (the ViT alone is 343 MB, which GitHub won't take). Grab
+them from Releases or train your own.
 
-`--rgb-ckpt` accepts your fine-tuned weights and the loader auto-strips the old
-2-class head. It prints how many backbone keys were missing — **that number
-should be ~0**. If it's large, the backend/model name is wrong:
+## A few decisions I'd defend
 
-- **timm** (default): `--rgb-backend timm --rgb-model vit_base_patch16_224`.
-  Works with a raw `state_dict`, a `{'model': ...}` wrapper, or `module.` prefixes.
-- **HuggingFace**: convert once, then use `--rgb-backend hf`:
-  ```python
-  from transformers import ViTForImageClassification
-  m = ViTForImageClassification.from_pretrained("your/ckpt")
-  torch.save(m.vit.state_dict(), "vit_backbone.pt")
-  ```
-  `--rgb-backend hf --rgb-model google/vit-base-patch16-224-in21k --rgb-ckpt vit_backbone.pt`
+**The dataset hands the model raw `[0,1]` images, and each encoder does its own
+preprocessing.** This looks like an oversight but isn't. If you ImageNet-normalize before
+the FFT or the SRM filters, you distort the exact signal those streams exist to read. The
+RGB stream normalizes internally.
 
----
+**SRM filters are fixed, Bayar is learnable.** The SRM kernels come from the steganalysis
+literature and carry a strong prior about what noise residuals look like; the Bayar conv
+learns a data-driven high-pass on top of that. Using both beat using either alone.
 
-## T4 / Colab memory notes (16 GB)
+**Cross-attention rather than late fusion.** I could have pooled each stream to a vector and
+concatenated. Letting the streams attend to each other's tokens before the decision is more
+expressive, and it means `explain.py` can tell you which stream actually drove a given
+prediction.
 
-Defaults are tuned for a T4. Three encoders + ViT-B is heavier than your baseline:
+**Recall is the headline number, not accuracy.** The entire problem here is fakes that slip
+through. Accuracy hides that behind a large real-image class.
 
-- `--batch-size 16 --accum 2` → effective batch 32 (same as your baseline) but
-  fits in 16 GB. If you OOM: drop to `--batch-size 8 --accum 4`.
-- Stage 2 (RGB frozen) is the cheap phase — you can use a bigger batch there;
-  the script keeps one batch size for simplicity, so size for Stage 3.
-- Mixed precision (AMP) is on everywhere. FFT and SRM are forced to fp32 inside
-  their modules (fp16 FFT is numerically unreliable) — that's intentional.
-- `resnet18` streams keep the extra cost small. `efficientnet_b0` is a drop-in
-  via `--cnn-backbone efficientnet_b0` if you want more capacity.
+## Things that bit me
 
----
+The Bayar convolution NaN'd on the first batch, every time. The constraint step divides the
+kernel by the sum of its surrounding weights, and at default init that sum can be near zero,
+so the weights explode. Fixed with a positive init and a guarded denominator. Gradient
+clipping is on now too.
 
-## Design choices worth defending in your report
+FFT and SRM run in fp32 even with AMP enabled. fp16 FFT is unreliable and this is
+deliberate, so don't "optimize" it away.
 
-- **Raw [0,1] images to the model, per-stream preprocessing inside each encoder.**
-  Normalising before FFT/SRM would distort the very signals those streams exist to
-  read. The RGB stream normalises internally with ImageNet stats.
-- **SRM (fixed) + Bayar (learnable) high-pass.** Fixed SRM gives a strong prior
-  from the steganalysis/forensics literature (Zhou et al., RGB-N); Bayar adapts a
-  data-driven high-pass on top. Together they surface local tamper residuals.
-- **Cross-attention via a joint transformer over multi-stream tokens.** Simpler
-  and more expressive than late-fusing three pooled vectors; the `[FUSION]` token
-  learns which stream to trust per-image (visible in `explain.py`'s per-stream scores).
-- **Recall is the headline metric.** Your study's story is "missed fakes", so
-  `evaluate.py` foregrounds fake-recall and the per-generator breakdown.
+PyTorch 2.6 flipped `torch.load` to `weights_only=True` by default, which rejects any
+checkpoint carrying NumPy scalars in its metadata. Everything here passes
+`weights_only=False`.
 
-## Natural next steps (your slide's future-work list)
-- Add diffusion faces as new fake sub-types in the manifest (the pipeline is
-  generator-agnostic — just add folders + tags).
-- Video benchmarks (FaceForensics++, Celeb-DF): extract frames, tag per source,
-  same manifest schema.
-- Continual learning: the frozen-RGB + trainable-fusion split is already a good
-  substrate for adding streams/generators without full retraining.
-```
+And the one that actually cost me a day: Colab's `/content` is wiped when the runtime
+recycles. I lost a finished 12-epoch run to an idle timeout. Write your checkpoints to
+Drive.
+
+## What's next
+
+Raise the auxiliary loss weight (0.3 → around 0.6) and see if FaceApp recall in the fused
+model can beat the frequency stream's standalone 0.92. Report test-split numbers rather than
+validation. Then extend to diffusion-generated faces, which should just be a new folder and
+a tag since nothing in the pipeline is generator-specific.
+
+## Credit
+
+DFFD comes from Dang et al., *On the Detection of Digital Face Manipulation*, CVPR 2020. If
+you use it, cite them and the underlying dataset sources.
