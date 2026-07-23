@@ -55,10 +55,6 @@ Broken down by generator:
 | FaceApp | 4,501 | 0.929 |
 | real faces | 9,000 | 0.026 wrongly flagged |
 
-![Detection interface](docs/ui.png)
-
-![Explainability panels](docs/explain_00.png)
-
 The number I care about is fake recall, because the whole problem was fakes slipping
 through. It went 0.29 (ViT on unseen generators) → 0.79 (same ViT, fine-tuned on DFFD) →
 **0.99** with the three streams fused. FaceApp, the category that motivated the whole
@@ -77,12 +73,40 @@ it, calibration fell apart — at one point it was flagging 46% of *real* faces 
 it never recovered its earlier score. So the recipe below keeps RGB frozen the whole way,
 which is both better and about three times faster.
 
+## Try it
+
+```bash
+pip install gradio
+python app/app.py --ckpt best.pt
+```
+
+Opens on `localhost:7860`. Drop in a face image and you get the verdict, each stream's own
+confidence, and the saliency / FFT / SRM panels behind the decision. Add `--share` if you're
+running it in Colab and want a public link.
+
+![Detection interface](docs/ui.png)
+
+The per-stream bars are the interesting part. On a fully synthesized face all three streams
+agree. On a FaceApp-style local edit the RGB stream is often unconvinced while the
+noise-residual stream is the one that catches it — which is the entire argument for building
+it this way.
+
+## What the model looked at
+
+`explain.py` produces a saliency map over P(fake), plus the FFT and SRM views each stream
+actually reads, and prints every stream's own confidence. So a verdict can be attributed
+rather than just asserted.
+
+![Explainability panels](docs/explain_00.png)
+
 ## What's in here
 
 ```
 common.py               metrics, seeding, checkpoint loading, per-generator reporting
 data.py                 dataset and transforms
 build_manifest_dffd.py  builds a manifest from DFFD's folder layout
+build_manifest.py       generic manifest builder, for other layouts
+requirements.txt
 models/
   rgb_encoder.py        ViT-B/16, loads a fine-tuned checkpoint
   freq_encoder.py       FFT spectrum → CNN → tokens
@@ -93,8 +117,26 @@ pretrain_stream.py      warm-starts the frequency / noise streams
 train.py                trains the fusion model
 evaluate.py             metrics + the per-generator table
 explain.py              saliency maps, FFT/SRM views, per-stream scores
-app/                    small UI — drop in an image, get a verdict
+app/app.py              Gradio UI — drop in an image, get a verdict + the evidence
+docs/                   screenshots and example explainability output
+presentations/          weekly and final decks
 ```
+
+## Pretrained weights
+
+The weights aren't committed — the ViT alone is 343 MB, past GitHub's file limit. They're
+attached to the [v1.0 release](https://github.com/Fyterox/PS-CDAC-CINE/releases/tag/v1.0):
+
+| File | What it is |
+|---|---|
+| `best.pt` | the final fusion model — this is the one you want |
+| `best_model_dffd.pt` | DFFD-fine-tuned ViT-B/16, the RGB stream |
+| `best_freq.pt` | warm-started frequency stream |
+| `best_noise.pt` | warm-started noise-residual stream |
+
+Download `best.pt` and you can run the demo or reproduce the evaluation without training
+anything. The other three are only needed if you want to retrain the fusion from my
+warm-started streams instead of doing Stage 1 yourself.
 
 ## Getting the data
 
@@ -131,7 +173,7 @@ pip install -r requirements.txt
 # manifest
 python build_manifest_dffd.py --root /path/to/DFFD --out manifest.csv
 
-# warm-start the two new streams (skip if you already have the checkpoints)
+# warm-start the two new streams (skip if you grabbed them from Releases)
 python pretrain_stream.py --stream freq  --manifest manifest.csv \
     --epochs 5 --batch-size 64 --out runs/freq_pretrain/best.pt
 python pretrain_stream.py --stream noise --manifest manifest.csv \
@@ -140,7 +182,7 @@ python pretrain_stream.py --stream noise --manifest manifest.csv \
 # fusion, RGB frozen throughout
 python train.py \
   --manifest manifest.csv \
-  --rgb-ckpt   ckpts/best_model_dffd.pt \
+  --rgb-ckpt   best_model_dffd.pt \
   --freq-init  runs/freq_pretrain/best.pt \
   --noise-init runs/noise_pretrain/best.pt \
   --epochs 4 --freeze-rgb-epochs 4 \
@@ -151,13 +193,10 @@ python evaluate.py --manifest manifest.csv --ckpt runs/fusion/best.pt
 python explain.py  --manifest manifest.csv --ckpt runs/fusion/best.pt --n 8 --out-dir runs/explain
 ```
 
-`--rgb-ckpt` is your DFFD-fine-tuned ViT. When it loads, it prints how many backbone keys
+`--rgb-ckpt` is the DFFD-fine-tuned ViT. When it loads, it prints how many backbone keys
 were missing. That should be 0. If it's a big number, your checkpoint is probably in
 HuggingFace format, in which case add
 `--rgb-backend hf --rgb-model google/vit-base-patch16-224-in21k`.
-
-I haven't committed the weights (the ViT alone is 343 MB, which GitHub won't take). Grab
-them from Releases or train your own.
 
 ## A few decisions I'd defend
 
