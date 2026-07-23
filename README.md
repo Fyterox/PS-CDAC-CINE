@@ -55,6 +55,10 @@ Broken down by generator:
 | FaceApp | 4,501 | 0.929 |
 | real faces | 9,000 | 0.026 wrongly flagged |
 
+![Detection interface](docs/ui.png)
+
+![Explainability panels](docs/explain_00.png)
+
 The number I care about is fake recall, because the whole problem was fakes slipping
 through. It went 0.29 (ViT on unseen generators) → 0.79 (same ViT, fine-tuned on DFFD) →
 **0.99** with the three streams fused. FaceApp, the category that motivated the whole
